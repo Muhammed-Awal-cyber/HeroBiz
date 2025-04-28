@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Live Network Traffic Monitor</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+        }
+        th, td {
+            padding: 8px;
+            border: 1px solid #ccc;
+            text-align: center;
+        }
+        button {
+            padding: 10px 20px;
+            margin-right: 10px;
+            font-size: 16px;
+        }
+        #startBtn:disabled {
+            background-color: #ccc;
+            cursor: not-allowed;
+        }
+        #stopBtn:disabled {
+            background-color: #ccc;
+            cursor: not-allowed;
+        }
+    </style>
+</head>
+<body>
+
+    <h1>Live Network Traffic Monitor</h1>
+
+    <button id="startBtn">Start Capture</button>
+    <button id="stopBtn" disabled>Stop Capture</button>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Time</th>
+                <th>Source MAC</th>
+                <th>Destination MAC</th>
+                <th>Source IP</th>
+                <th>Destination IP</th>
+                <th>Protocols</th>
+            </tr>
+        </thead>
+        <tbody id="packetTableBody">
+        </tbody>
+    </table>
+
+    <script src="app.js"></script>
+</body>
+</html>
