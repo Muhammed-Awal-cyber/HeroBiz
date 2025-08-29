@@ -1,47 +1,404 @@
-import subprocess
-from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse
+import csv
+import tempfile
+# Add a global to store captured packets for CSV export
+captured_packets_for_csv = []
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse, FileResponse
+import csv
+import tempfile
+# Add a global to store captured packets for CSV export
+captured_packets_for_csv = []
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
 import json
+import threading
+import queue
+import pyshark
+from datetime import datetime
+import logging
+import subprocess
+import sqlite3
+import asyncio
+from typing import Tuple, Optional
+import ipaddress
 
 app = FastAPI()
+@app.delete("/registered/{ip_address}")
+def delete_registered(ip_address: str):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("DELETE FROM registered_ips WHERE ip_address = ?", (ip_address,))
+        if cur.rowcount == 0:
+            conn.close()
+            raise HTTPException(status_code=404, detail="IP address not found")
+        conn.commit()
+        conn.close()
+        return {"status": "ok", "message": f"IP {ip_address} deleted successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-# Allow CORS
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("PacketCapture")
+
+# CORS (allow everything for local dev, restrict in production)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Update to specific origins in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-@app.get("/capture")
+# Static & templates
+app.mount("/static", StaticFiles(directory="static"), name="static")
+templates = Jinja2Templates(directory="templates")
+
+# Globals
+packet_queue = queue.Queue(maxsize=10000)
+stop_event = threading.Event()
+capture_thread: Optional[threading.Thread] = None
+
+# Database
+DB_PATH = "register_ip.db"
+
+# Interface
+INTERFACE = "wlp1s0"  # Change if necessary
+
+# Pydantic model for IP registration
+class IpRegistration(BaseModel):
+    ip_address: str
+    device_name: str | None = None
+
+def init_db():
+    """Create DB and table if it doesn't exist."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS registered_ips (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ip_address TEXT UNIQUE NOT NULL,
+                device_name TEXT
+            )
+        """)
+        conn.commit()
+        conn.close()
+        logger.info("Database initialized and table ensured.")
+    except Exception as e:
+        logger.error(f"Failed to initialize DB: {e}")
+
+def db_check_ip(ip: str) -> Tuple[bool, Optional[str]]:
+    """Return (is_registered, device_name or None)."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT device_name FROM registered_ips WHERE ip_address = ?", (ip,))
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            return True, row[0]
+        return False, None
+    except Exception as e:
+        logger.error(f"Database error checking IP {ip}: {e}")
+        return False, None
+
+def verify_tshark_installation() -> bool:
+    try:
+        subprocess.run(["tshark", "--version"], capture_output=True, text=True, check=True)
+        logger.info("TShark is available")
+        return True
+    except Exception as e:
+        logger.error(f"TShark not found or error: {e}")
+        return False
+
+def create_capture(interface: str) -> pyshark.LiveCapture:
+    return pyshark.LiveCapture(
+        interface=interface,
+        display_filter='tcp or udp or http or ssl or dns or icmp',
+        use_json=False,
+        include_raw=False,
+        custom_parameters=['-l', '-n', '-q', '--no-promiscuous-mode']
+    )
+
+def process_packet(packet) -> Optional[dict]:
+    """Convert pyshark Packet -> dict for sending to frontend."""
+    try:
+        pkt = {
+            "time": getattr(packet, "sniff_time", datetime.now()).isoformat(),
+            "protocol": "N/A",
+            "src_ip": "N/A",
+            "dst_ip": "N/A",
+            "src_port": "N/A",
+            "dst_port": "N/A",
+            "length": "N/A",
+            "info": ""
+        }
+
+        # Extract IP addresses
+        if hasattr(packet, "ip"):
+            pkt["src_ip"] = getattr(packet.ip, "src", "N/A")
+            pkt["dst_ip"] = getattr(packet.ip, "dst", "N/A")
+        elif hasattr(packet, "ipv6"):
+            pkt["src_ip"] = getattr(packet.ipv6, "src", "N/A")
+            pkt["dst_ip"] = getattr(packet.ipv6, "dst", "N/A")
+
+        # Length
+        length_val = None
+        for attr in ("length", "len"):
+            length_val = getattr(packet, attr, None)
+            if length_val:
+                break
+        if not length_val and hasattr(packet, "frame_info") and hasattr(packet.frame_info, "len"):
+            length_val = packet.frame_info.len
+        if length_val:
+            pkt["length"] = str(length_val)
+
+        # Protocol detection
+        if hasattr(packet, "tcp"):
+            pkt["protocol"] = "TCP"
+            pkt["src_port"] = getattr(packet.tcp, "srcport", "N/A")
+            pkt["dst_port"] = getattr(packet.tcp, "dstport", "N/A")
+            flags = getattr(packet.tcp, "flags", "")
+            if flags:
+                pkt["info"] = f"TCP flags: {flags}"
+        elif hasattr(packet, "udp"):
+            pkt["protocol"] = "UDP"
+            pkt["src_port"] = getattr(packet.udp, "srcport", "N/A")
+            pkt["dst_port"] = getattr(packet.udp, "dstport", "N/A")
+            pkt["info"] = f"UDP {pkt['src_port']}→{pkt['dst_port']}"
+        elif hasattr(packet, "icmp"):
+            pkt["protocol"] = "ICMP"
+            pkt["info"] = "ICMP"
+        elif hasattr(packet, "http"):
+            pkt["protocol"] = "HTTP"
+            method = getattr(packet.http, "request_method", None)
+            uri = getattr(packet.http, "request_uri", None)
+            if method and uri:
+                pkt["info"] = f"{method} {uri}"
+        elif hasattr(packet, "ssl") or hasattr(packet, "tls"):
+            pkt["protocol"] = "HTTPS"
+            pkt["info"] = "SSL/TLS"
+
+        # Check only src_ip for registration
+        if pkt["src_ip"] not in ("N/A", None, ""):
+            registered, device_name = db_check_ip(pkt["src_ip"])
+            pkt["status"] = "Known User" if registered else "Unknown User"
+            pkt["status_color"] = "green" if registered else "red"
+            if device_name:
+                pkt["device_name"] = device_name
+        else:
+            pkt["status"] = "Unknown User"
+            pkt["status_color"] = "red"
+
+        if pkt["src_ip"] != "N/A" and pkt["dst_ip"] != "N/A":
+            # Store for CSV download
+            captured_packets_for_csv.append(pkt)
+            return pkt
+    except Exception as e:
+        logger.warning(f"Failed to process packet: {e}")
+    return None
+
+# Endpoint to download captured packets as CSV
+@app.get("/download-csv")
+def download_csv():
+    if not captured_packets_for_csv:
+        raise HTTPException(status_code=404, detail="No captured packets to export.")
+    # Use a temporary file for the CSV
+    with tempfile.NamedTemporaryFile(mode="w", delete=False, newline='', suffix=".csv") as tmp:
+        writer = csv.DictWriter(tmp, fieldnames=[
+            "time", "protocol", "src_ip", "dst_ip", "src_port", "dst_port", "length", "info", "status", "status_color", "device_name"
+        ])
+        writer.writeheader()
+        for pkt in captured_packets_for_csv:
+            writer.writerow(pkt)
+        tmp_path = tmp.name
+    return FileResponse(tmp_path, media_type="text/csv", filename="captured_packets.csv")
+    return None
+
+# Endpoint to download captured packets as CSV (must be at module level)
+@app.get("/download-csv")
+def download_csv():
+    if not captured_packets_for_csv:
+        raise HTTPException(status_code=404, detail="No captured packets to export.")
+    # Use a temporary file for the CSV
+    with tempfile.NamedTemporaryFile(mode="w", delete=False, newline='', suffix=".csv") as tmp:
+        writer = csv.DictWriter(tmp, fieldnames=[
+            "time", "protocol", "src_ip", "dst_ip", "src_port", "dst_port", "length", "info", "status", "status_color", "device_name"
+        ])
+        writer.writeheader()
+        for pkt in captured_packets_for_csv:
+            writer.writerow(pkt)
+        tmp_path = tmp.name
+    return FileResponse(tmp_path, media_type="text/csv", filename="captured_packets.csv")
+
+# Endpoint to download captured packets as CSV (moved to module level)
+@app.get("/download-csv")
+def download_csv():
+    if not captured_packets_for_csv:
+        raise HTTPException(status_code=404, detail="No captured packets to export.")
+    # Use a temporary file for the CSV
+    with tempfile.NamedTemporaryFile(mode="w", delete=False, newline='', suffix=".csv") as tmp:
+        writer = csv.DictWriter(tmp, fieldnames=[
+            "time", "protocol", "src_ip", "dst_ip", "src_port", "dst_port", "length", "info", "status", "status_color", "device_name"
+        ])
+        writer.writeheader()
+        for pkt in captured_packets_for_csv:
+            writer.writerow(pkt)
+        tmp_path = tmp.name
+    return FileResponse(tmp_path, media_type="text/csv", filename="captured_packets.csv")
+
 def capture_packets():
-    def packet_generator():
-        process = subprocess.Popen([
-            r"C:\Program Files\Wireshark\tshark.exe",
-            "-i", "5",
-            "-l",  # Make tshark line-buffered (important for real-time)
-            "-T", "fields",
-            "-e", "frame.time",
-            "-e", "eth.src",
-            "-e", "eth.dst",
-            "-e", "ip.src",
-            "-e", "ip.dst",
-            "-e", "frame.protocols"
-        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    """Thread target that captures packets and pushes dicts to packet_queue."""
+    try:
+        logger.info(f"Starting capture on interface: {INTERFACE}")
+        capture = create_capture(INTERFACE)
 
-        for line in process.stdout:
-            fields = line.strip().split('\t')
-            if len(fields) >= 6:
-                packet = {
-                    "time": fields[0],
-                    "source_mac": fields[1],
-                    "destination_mac": fields[2],
-                    "source_ip": fields[3],
-                    "destination_ip": fields[4],
-                    "protocols": fields[5]
-                }
-                yield f"data: {json.dumps(packet)}\n\n"
+        for packet in capture.sniff_continuously():
+            if stop_event.is_set():
+                logger.info("Stop event set, breaking capture loop.")
+                break
+            try:
+                pkt = process_packet(packet)
+                if pkt:
+                    try:
+                        packet_queue.put(pkt, timeout=0.5)
+                    except queue.Full:
+                        logger.warning("Packet queue full; dropping packet")
+            except Exception as e:
+                logger.exception(f"Exception processing a packet: {e}")
 
-    return StreamingResponse(packet_generator(), media_type="text/event-stream")
+        capture.close()
+        logger.info("Capture thread exited.")
+    except Exception as e:
+        logger.exception(f"Capture failed: {e}")
+        packet_queue.put({
+            "error": str(e),
+            "time": datetime.now().isoformat(),
+            "message": "Capture failed - check interface/permissions"
+        })
+
+@app.on_event("startup")
+async def startup_event():
+    init_db()
+    verify_tshark_installation()
+
+@app.get("/")
+async def root(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
+@app.api_route("/start", methods=["GET", "POST"])
+def start_capture():
+    global capture_thread
+    if not verify_tshark_installation():
+        raise HTTPException(status_code=500, detail="TShark is not installed or accessible")
+
+    if capture_thread and capture_thread.is_alive():
+        return {"status": "Already running"}
+
+    stop_event.clear()
+    capture_thread = threading.Thread(target=capture_packets, daemon=True)
+    capture_thread.start()
+    logger.info("Capture thread started.")
+    return {"status": "Capture started"}
+
+@app.api_route("/stop", methods=["GET", "POST"])
+def stop_capture():
+    stop_event.set()
+    return {"status": "Capture stopped"}
+
+@app.get("/stream")
+async def stream_packets():
+    async def event_stream():
+        loop = asyncio.get_event_loop()
+        while not stop_event.is_set() or not packet_queue.empty():
+            try:
+                pkt = await loop.run_in_executor(None, packet_queue.get, True, 1)
+                try:
+                    yield f"data: {json.dumps(pkt)}\n\n"
+                except Exception as e:
+                    logger.warning(f"Failed to yield packet: {e}")
+            except queue.Empty:
+                yield ": heartbeat\n\n"
+                await asyncio.sleep(0.1)
+        logger.info("SSE generator exiting (stop event + empty queue).")
+
+    headers = {
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no'
+    }
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers=headers)
+
+@app.get("/registered")
+def list_registered():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT ip_address, device_name FROM registered_ips ORDER BY id")
+        rows = cur.fetchall()
+        conn.close()
+        return {"registered": [{"ip": r[0], "device_name": r[1]} for r in rows]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/registered")
+def add_registered(ip_registration: IpRegistration):
+    try:
+        # Validate IP address format
+        try:
+            ipaddress.ip_address(ip_registration.ip_address)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid IP address format")
+
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT OR IGNORE INTO registered_ips (ip_address, device_name) VALUES (?, ?)",
+            (ip_registration.ip_address, ip_registration.device_name)
+        )
+        if cur.rowcount == 0:
+            conn.close()
+            raise HTTPException(status_code=409, detail="IP address already registered")
+        
+        conn.commit()
+        conn.close()
+        return {"status": "ok", "message": f"IP {ip_registration.ip_address} registered successfully"}
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Error registering IP: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to register IP: {str(e)}")
+
+@app.post("/register-client-ip")
+async def register_client_ip(device_name: str | None = None, request: Request = None):
+    try:
+        client_ip = request.headers.get("x-forwarded-for", request.client.host)
+        try:
+            ipaddress.ip_address(client_ip)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid client IP address")
+
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT OR IGNORE INTO registered_ips (ip_address, device_name) VALUES (?, ?)",
+            (client_ip, device_name)
+        )
+        if cur.rowcount == 0:
+            conn.close()
+            raise HTTPException(status_code=409, detail="Client IP already registered")
+        
+        conn.commit()
+        conn.close()
+        return {"status": "ok", "message": f"Client IP {client_ip} registered successfully"}
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Error registering client IP: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to register client IP: {str(e)}")
+    
