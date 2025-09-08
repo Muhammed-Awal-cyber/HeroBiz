@@ -138,6 +138,11 @@ class PacketCapture {
     this.elements.startBtn.disabled = true;
     this.elements.stopBtn.disabled = false;
     this.elements.downloadBtn.disabled = true;
+    // Indicate capture is running
+    if (this.elements.statusDiv) {
+      this.elements.statusDiv.textContent = 'Capture running';
+      this.elements.statusDiv.className = 'mb-3 text-center status-active';
+    }
 
     try {
       const response = await fetch(`${this.API_URL}/start`, { method: 'POST' });
@@ -254,6 +259,16 @@ class PacketCapture {
       this.reconnectTimeout = null;
     }
 
+    const setStoppedUI = () => {
+      if (this.elements.statusDiv) {
+        this.elements.statusDiv.textContent = 'Capture stopped';
+        this.elements.statusDiv.className = 'mb-3 text-center status-stopped';
+      }
+      this.elements.startBtn.disabled = false;
+      this.elements.stopBtn.disabled = true;
+      this.elements.downloadBtn.disabled = false;
+    };
+
     if (hardStop) {
       fetch(`${this.API_URL}/stop`, { method: 'POST' })
         .then(async res => {
@@ -262,10 +277,7 @@ class PacketCapture {
             try { msg = (await res.json()).detail || JSON.stringify(await res.json()); } catch { msg = await res.text(); }
             throw new Error(msg);
           }
-          this.updateStatus('Capture stopped. You can now download PCAP.', 'status-stopped');
-          this.elements.startBtn.disabled = false;
-          this.elements.stopBtn.disabled = true;
-          this.elements.downloadBtn.disabled = false;
+          setStoppedUI();
         })
         .catch(error => {
           console.error('Stop error:', error);
@@ -273,10 +285,7 @@ class PacketCapture {
           this.elements.startBtn.disabled = false;
         });
     } else {
-      this.updateStatus('Capture stopped (soft). You can now download PCAP.', 'status-stopped');
-      this.elements.startBtn.disabled = false;
-      this.elements.stopBtn.disabled = true;
-      this.elements.downloadBtn.disabled = false;
+      setStoppedUI();
     }
   }
 

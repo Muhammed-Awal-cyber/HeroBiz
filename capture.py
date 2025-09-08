@@ -1,15 +1,5 @@
-from fastapi.responses import FileResponse
-import csv
-import tempfile
-# Add a global to store captured packets for CSV export
-captured_packets_for_csv = []
-
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, FileResponse
-import csv
-import tempfile
-# Add a global to store captured packets for CSV export
-captured_packets_for_csv = []
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -25,22 +15,11 @@ import sqlite3
 import asyncio
 from typing import Tuple, Optional
 import ipaddress
+import csv
+import tempfile
+import io
 
 app = FastAPI()
-@app.delete("/registered/{ip_address}")
-def delete_registered(ip_address: str):
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        cur.execute("DELETE FROM registered_ips WHERE ip_address = ?", (ip_address,))
-        if cur.rowcount == 0:
-            conn.close()
-            raise HTTPException(status_code=404, detail="IP address not found")
-        conn.commit()
-        conn.close()
-        return {"status": "ok", "message": f"IP {ip_address} deleted successfully"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("PacketCapture")
@@ -69,10 +48,17 @@ DB_PATH = "register_ip.db"
 # Interface
 INTERFACE = "wlp1s0"  # Change if necessary
 
+# Add a global to store captured packets for CSV export
+captured_packets_for_csv = []
+
 # Pydantic model for IP registration
 class IpRegistration(BaseModel):
     ip_address: str
     device_name: str | None = None
+
+# Pydantic model for IP deletion
+class IpDeletion(BaseModel):
+    ip_address: str
 
 def init_db():
     """Create DB and table if it doesn't exist."""
@@ -119,10 +105,10 @@ def verify_tshark_installation() -> bool:
 def create_capture(interface: str) -> pyshark.LiveCapture:
     return pyshark.LiveCapture(
         interface=interface,
-        display_filter='tcp or udp or http or ssl or dns or icmp',
+        display_filter='tcp or udp or http or ssl or dns or icmp or arp or bootp or dhcp',
         use_json=False,
         include_raw=False,
-        custom_parameters=['-l', '-n', '-q', '--no-promiscuous-mode']
+        custom_parameters=['-l', '-n', '-q']  # Removed --no-promiscuous-mode to enable promiscuous mode
     )
 
 def process_packet(packet) -> Optional[dict]:
@@ -184,7 +170,7 @@ def process_packet(packet) -> Optional[dict]:
             pkt["protocol"] = "HTTPS"
             pkt["info"] = "SSL/TLS"
 
-        # Check only src_ip for registration
+        # Check only src_ip for registration (source IP -> Known/Unknown)
         if pkt["src_ip"] not in ("N/A", None, ""):
             registered, device_name = db_check_ip(pkt["src_ip"])
             pkt["status"] = "Known User" if registered else "Unknown User"
@@ -195,62 +181,14 @@ def process_packet(packet) -> Optional[dict]:
             pkt["status"] = "Unknown User"
             pkt["status_color"] = "red"
 
+        # Only send valid packets with both IPs
         if pkt["src_ip"] != "N/A" and pkt["dst_ip"] != "N/A":
-            # Store for CSV download
             captured_packets_for_csv.append(pkt)
             return pkt
+
     except Exception as e:
         logger.warning(f"Failed to process packet: {e}")
     return None
-
-# Endpoint to download captured packets as CSV
-@app.get("/download-csv")
-def download_csv():
-    if not captured_packets_for_csv:
-        raise HTTPException(status_code=404, detail="No captured packets to export.")
-    # Use a temporary file for the CSV
-    with tempfile.NamedTemporaryFile(mode="w", delete=False, newline='', suffix=".csv") as tmp:
-        writer = csv.DictWriter(tmp, fieldnames=[
-            "time", "protocol", "src_ip", "dst_ip", "src_port", "dst_port", "length", "info", "status", "status_color", "device_name"
-        ])
-        writer.writeheader()
-        for pkt in captured_packets_for_csv:
-            writer.writerow(pkt)
-        tmp_path = tmp.name
-    return FileResponse(tmp_path, media_type="text/csv", filename="captured_packets.csv")
-    return None
-
-# Endpoint to download captured packets as CSV (must be at module level)
-@app.get("/download-csv")
-def download_csv():
-    if not captured_packets_for_csv:
-        raise HTTPException(status_code=404, detail="No captured packets to export.")
-    # Use a temporary file for the CSV
-    with tempfile.NamedTemporaryFile(mode="w", delete=False, newline='', suffix=".csv") as tmp:
-        writer = csv.DictWriter(tmp, fieldnames=[
-            "time", "protocol", "src_ip", "dst_ip", "src_port", "dst_port", "length", "info", "status", "status_color", "device_name"
-        ])
-        writer.writeheader()
-        for pkt in captured_packets_for_csv:
-            writer.writerow(pkt)
-        tmp_path = tmp.name
-    return FileResponse(tmp_path, media_type="text/csv", filename="captured_packets.csv")
-
-# Endpoint to download captured packets as CSV (moved to module level)
-@app.get("/download-csv")
-def download_csv():
-    if not captured_packets_for_csv:
-        raise HTTPException(status_code=404, detail="No captured packets to export.")
-    # Use a temporary file for the CSV
-    with tempfile.NamedTemporaryFile(mode="w", delete=False, newline='', suffix=".csv") as tmp:
-        writer = csv.DictWriter(tmp, fieldnames=[
-            "time", "protocol", "src_ip", "dst_ip", "src_port", "dst_port", "length", "info", "status", "status_color", "device_name"
-        ])
-        writer.writeheader()
-        for pkt in captured_packets_for_csv:
-            writer.writerow(pkt)
-        tmp_path = tmp.name
-    return FileResponse(tmp_path, media_type="text/csv", filename="captured_packets.csv")
 
 def capture_packets():
     """Thread target that captures packets and pushes dicts to packet_queue."""
@@ -258,6 +196,7 @@ def capture_packets():
         logger.info(f"Starting capture on interface: {INTERFACE}")
         capture = create_capture(INTERFACE)
 
+        # sniff_continuously yields pyshark Packet objects
         for packet in capture.sniff_continuously():
             if stop_event.is_set():
                 logger.info("Stop event set, breaking capture loop.")
@@ -276,21 +215,27 @@ def capture_packets():
         logger.info("Capture thread exited.")
     except Exception as e:
         logger.exception(f"Capture failed: {e}")
+        # provide a message to frontend
         packet_queue.put({
             "error": str(e),
             "time": datetime.now().isoformat(),
             "message": "Capture failed - check interface/permissions"
         })
 
+
 @app.on_event("startup")
 async def startup_event():
     init_db()
     verify_tshark_installation()
 
+
 @app.get("/")
 async def root(request: Request):
+    # Renders templates/index.html — put your HTML into templates/index.html
     return templates.TemplateResponse("index.html", {"request": request})
 
+
+# Accept both GET and POST for start (prevents 405 if frontend uses POST)
 @app.api_route("/start", methods=["GET", "POST"])
 def start_capture():
     global capture_thread
@@ -300,16 +245,23 @@ def start_capture():
     if capture_thread and capture_thread.is_alive():
         return {"status": "Already running"}
 
+    # Clear previous captured packets for a new session
+    captured_packets_for_csv.clear()
+
+    # Clear any previous stop flag and start thread
     stop_event.clear()
     capture_thread = threading.Thread(target=capture_packets, daemon=True)
     capture_thread.start()
     logger.info("Capture thread started.")
     return {"status": "Capture started"}
 
+
+# Accept both GET and POST for stop too
 @app.api_route("/stop", methods=["GET", "POST"])
 def stop_capture():
     stop_event.set()
     return {"status": "Capture stopped"}
+
 
 @app.get("/stream")
 async def stream_packets():
@@ -317,12 +269,14 @@ async def stream_packets():
         loop = asyncio.get_event_loop()
         while not stop_event.is_set() or not packet_queue.empty():
             try:
+                # Use run_in_executor to avoid blocking event loop
                 pkt = await loop.run_in_executor(None, packet_queue.get, True, 1)
                 try:
                     yield f"data: {json.dumps(pkt)}\n\n"
                 except Exception as e:
                     logger.warning(f"Failed to yield packet: {e}")
             except queue.Empty:
+                # heartbeat to keep SSE alive
                 yield ": heartbeat\n\n"
                 await asyncio.sleep(0.1)
         logger.info("SSE generator exiting (stop event + empty queue).")
@@ -334,6 +288,8 @@ async def stream_packets():
     }
     return StreamingResponse(event_stream(), media_type="text/event-stream", headers=headers)
 
+
+# Optional: endpoints to manage registered IPs
 @app.get("/registered")
 def list_registered():
     try:
@@ -346,59 +302,51 @@ def list_registered():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.post("/registered")
 def add_registered(ip_registration: IpRegistration):
     try:
-        # Validate IP address format
-        try:
-            ipaddress.ip_address(ip_registration.ip_address)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid IP address format")
-
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
-        cur.execute(
-            "INSERT OR IGNORE INTO registered_ips (ip_address, device_name) VALUES (?, ?)",
-            (ip_registration.ip_address, ip_registration.device_name)
-        )
-        if cur.rowcount == 0:
-            conn.close()
-            raise HTTPException(status_code=409, detail="IP address already registered")
-        
+        cur.execute("INSERT OR IGNORE INTO registered_ips (ip_address, device_name) VALUES (?, ?)",
+                    (ip_registration.ip_address, ip_registration.device_name))
         conn.commit()
         conn.close()
-        return {"status": "ok", "message": f"IP {ip_registration.ip_address} registered successfully"}
-    except HTTPException as he:
-        raise he
+        return {"status": "ok"}
     except Exception as e:
-        logger.error(f"Error registering IP: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to register IP: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/register-client-ip")
-async def register_client_ip(device_name: str | None = None, request: Request = None):
+@app.delete("/registered/{ip_address}")
+def delete_registered(ip_address: str):
     try:
-        client_ip = request.headers.get("x-forwarded-for", request.client.host)
-        try:
-            ipaddress.ip_address(client_ip)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid client IP address")
-
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
-        cur.execute(
-            "INSERT OR IGNORE INTO registered_ips (ip_address, device_name) VALUES (?, ?)",
-            (client_ip, device_name)
-        )
+        cur.execute("DELETE FROM registered_ips WHERE ip_address = ?", (ip_address,))
         if cur.rowcount == 0:
             conn.close()
-            raise HTTPException(status_code=409, detail="Client IP already registered")
-        
+            raise HTTPException(status_code=404, detail="IP address not found")
         conn.commit()
         conn.close()
-        return {"status": "ok", "message": f"Client IP {client_ip} registered successfully"}
-    except HTTPException as he:
-        raise he
+        return {"status": "ok", "message": f"IP {ip_address} deleted successfully"}
     except Exception as e:
-        logger.error(f"Error registering client IP: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to register client IP: {str(e)}")
-    
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/download-csv")
+async def download_csv():
+    if not captured_packets_for_csv:
+        raise HTTPException(status_code=404, detail="No packets captured yet")
+
+    output = io.StringIO()
+    headers = ["time", "protocol", "src_ip", "dst_ip", "src_port", "dst_port", "length", "info", "status", "status_color", "device_name"]
+    writer = csv.DictWriter(output, fieldnames=headers)
+    writer.writeheader()
+    for pkt in captured_packets_for_csv:
+        row = {k: pkt.get(k, "N/A") for k in headers}
+        writer.writerow(row)
+    output.seek(0)
+    return StreamingResponse(
+        output,
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=captured_packets.csv"}
+    )
