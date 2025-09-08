@@ -115,7 +115,7 @@ class PacketCapture {
   }
   async deleteIpFromTable(ip) {
     try {
-      // Most REST APIs expect the IP in the URL for DELETE
+      
       const response = await fetch(`${this.API_URL}/registered/${ip}`, {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' }
@@ -138,7 +138,7 @@ class PacketCapture {
     this.elements.startBtn.disabled = true;
     this.elements.stopBtn.disabled = false;
     this.elements.downloadBtn.disabled = true;
-    // Indicate capture is running
+    
     if (this.elements.statusDiv) {
       this.elements.statusDiv.textContent = 'Capture running';
       this.elements.statusDiv.className = 'mb-3 text-center status-active';

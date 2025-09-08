@@ -24,39 +24,39 @@ app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("PacketCapture")
 
-# CORS (allow everything for local dev, restrict in production)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Update to specific origins in production
+    allow_origins=["*"],  
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Static & templates
+
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
-# Globals
+
 packet_queue = queue.Queue(maxsize=10000)
 stop_event = threading.Event()
 capture_thread: Optional[threading.Thread] = None
 
-# Database
+
 DB_PATH = "register_ip.db"
 
-# Interface
-INTERFACE = "wlp1s0"  # Change if necessary
 
-# Add a global to store captured packets for CSV export
+INTERFACE = "wlp1s0"  
+
+
 captured_packets_for_csv = []
 
-# Pydantic model for IP registration
+
 class IpRegistration(BaseModel):
     ip_address: str
     device_name: str | None = None
 
-# Pydantic model for IP deletion
+
 class IpDeletion(BaseModel):
     ip_address: str
 
@@ -108,7 +108,7 @@ def create_capture(interface: str) -> pyshark.LiveCapture:
         display_filter='tcp or udp or http or ssl or dns or icmp or arp or bootp or dhcp',
         use_json=False,
         include_raw=False,
-        custom_parameters=['-l', '-n', '-q']  # Removed --no-promiscuous-mode to enable promiscuous mode
+        custom_parameters=['-l', '-n', '-q']  
     )
 
 def process_packet(packet) -> Optional[dict]:
@@ -125,7 +125,7 @@ def process_packet(packet) -> Optional[dict]:
             "info": ""
         }
 
-        # Extract IP addresses
+        
         if hasattr(packet, "ip"):
             pkt["src_ip"] = getattr(packet.ip, "src", "N/A")
             pkt["dst_ip"] = getattr(packet.ip, "dst", "N/A")
@@ -133,7 +133,7 @@ def process_packet(packet) -> Optional[dict]:
             pkt["src_ip"] = getattr(packet.ipv6, "src", "N/A")
             pkt["dst_ip"] = getattr(packet.ipv6, "dst", "N/A")
 
-        # Length
+        
         length_val = None
         for attr in ("length", "len"):
             length_val = getattr(packet, attr, None)
@@ -144,7 +144,7 @@ def process_packet(packet) -> Optional[dict]:
         if length_val:
             pkt["length"] = str(length_val)
 
-        # Protocol detection
+        
         if hasattr(packet, "tcp"):
             pkt["protocol"] = "TCP"
             pkt["src_port"] = getattr(packet.tcp, "srcport", "N/A")
@@ -170,7 +170,7 @@ def process_packet(packet) -> Optional[dict]:
             pkt["protocol"] = "HTTPS"
             pkt["info"] = "SSL/TLS"
 
-        # Check only src_ip for registration (source IP -> Known/Unknown)
+        
         if pkt["src_ip"] not in ("N/A", None, ""):
             registered, device_name = db_check_ip(pkt["src_ip"])
             pkt["status"] = "Known User" if registered else "Unknown User"
@@ -181,7 +181,7 @@ def process_packet(packet) -> Optional[dict]:
             pkt["status"] = "Unknown User"
             pkt["status_color"] = "red"
 
-        # Only send valid packets with both IPs
+        
         if pkt["src_ip"] != "N/A" and pkt["dst_ip"] != "N/A":
             captured_packets_for_csv.append(pkt)
             return pkt
@@ -196,7 +196,7 @@ def capture_packets():
         logger.info(f"Starting capture on interface: {INTERFACE}")
         capture = create_capture(INTERFACE)
 
-        # sniff_continuously yields pyshark Packet objects
+        
         for packet in capture.sniff_continuously():
             if stop_event.is_set():
                 logger.info("Stop event set, breaking capture loop.")
@@ -215,7 +215,7 @@ def capture_packets():
         logger.info("Capture thread exited.")
     except Exception as e:
         logger.exception(f"Capture failed: {e}")
-        # provide a message to frontend
+        
         packet_queue.put({
             "error": str(e),
             "time": datetime.now().isoformat(),
@@ -231,11 +231,11 @@ async def startup_event():
 
 @app.get("/")
 async def root(request: Request):
-    # Renders templates/index.html — put your HTML into templates/index.html
+    
     return templates.TemplateResponse("index.html", {"request": request})
 
 
-# Accept both GET and POST for start (prevents 405 if frontend uses POST)
+
 @app.api_route("/start", methods=["GET", "POST"])
 def start_capture():
     global capture_thread
@@ -245,10 +245,10 @@ def start_capture():
     if capture_thread and capture_thread.is_alive():
         return {"status": "Already running"}
 
-    # Clear previous captured packets for a new session
+    
     captured_packets_for_csv.clear()
 
-    # Clear any previous stop flag and start thread
+    
     stop_event.clear()
     capture_thread = threading.Thread(target=capture_packets, daemon=True)
     capture_thread.start()
@@ -256,7 +256,7 @@ def start_capture():
     return {"status": "Capture started"}
 
 
-# Accept both GET and POST for stop too
+
 @app.api_route("/stop", methods=["GET", "POST"])
 def stop_capture():
     stop_event.set()
@@ -269,14 +269,14 @@ async def stream_packets():
         loop = asyncio.get_event_loop()
         while not stop_event.is_set() or not packet_queue.empty():
             try:
-                # Use run_in_executor to avoid blocking event loop
+                
                 pkt = await loop.run_in_executor(None, packet_queue.get, True, 1)
                 try:
                     yield f"data: {json.dumps(pkt)}\n\n"
                 except Exception as e:
                     logger.warning(f"Failed to yield packet: {e}")
             except queue.Empty:
-                # heartbeat to keep SSE alive
+                
                 yield ": heartbeat\n\n"
                 await asyncio.sleep(0.1)
         logger.info("SSE generator exiting (stop event + empty queue).")
@@ -289,7 +289,7 @@ async def stream_packets():
     return StreamingResponse(event_stream(), media_type="text/event-stream", headers=headers)
 
 
-# Optional: endpoints to manage registered IPs
+
 @app.get("/registered")
 def list_registered():
     try:
@@ -348,5 +348,5 @@ async def download_csv():
     return StreamingResponse(
         output,
         media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=captured_packets.csv"}
+        headers={"Content-Disposition": "attachment; filename=Packet.csv"}
     )
